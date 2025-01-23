@@ -1,0 +1,437 @@
+Caching Device Protocol
+=======================
+:version: 1
+
+Version:: {version}
+State:: Draft
+
+Rationale
+---------
+To control devices in an industrial environment (and elsewhere) it is
+necessary for those devices to have an machine to machine interface.
+However many of the traditional industrial bus systems are too complex
+and have often hardware requrements, that make them unsuitable for
+simple devices.
+
+This leads to simple ad hoc protocols that every device defines for
+itself. Those protocols are often either slow (because of sending to
+much uncompressed data) or complicated for clients because they are not
+standardized.
+
+This document defines the _Caching Device Protocol_ which tries to
+address those problems by targeting the following goals:
+
+* standardized: You can read the spec here. It is suited both for human
+  consuption, as well as for machine validation.
+* extendable: You can define your own usecase inside the boundaries of
+  the protocol.
+* fast: The protocol uses binary data to not waste space and bandwidth.
+  Additionally it uses caching to reduce the amount of data send over
+  the wire.
+* simple to use / explorable: Since it defines machine readable
+  subprotocols it is possible to write clients that automatically find
+  and list the capabilities of compatible devices.
+
+General Architecture
+--------------------
+
+=== Request Response
+The _Caching Device Protocol_ is a classical sequential request response
+protocol. In other words: You only get a response if you send a request
+before footnote:[Alternative names for this kind of protocol are
+Master-Slave or Client-Server].
+
+* PC/PLC/... (Client) -> Device (Server): request
+* PC/PLC/... (Client) <- Device (Server): response
+
+[[lifetime]]
+=== Lifetime Categories
+Every Dataset that can be fetched from the protocol will have a livetime
+category assigned. Lifetime categories indicate how long a variable will
+be valid (in other words: when it has to be refetched by the client in
+order to be still uptodate).
+
+It is possible to define your own lifetime categories. As a starting
+point, however, we suggest the following categories:
+
+Identity Data:: This data is very stable and does not change often.
+  Normally it will only be changed when a device is build, setup, after
+  maintanance or after a software update.
+Configuration Data:: This data could be for example configurations,
+  which can be updated during normal runtime, but often, after
+  an initial setup period, are very stable over comparable long
+  timeperiods.
+Session Data:: These datasets change often during runtime. Usually
+  they are changed in reaction to requests from a client or other input
+  events. Because of this, clients have an interest to be informed about
+  changes as soon as possible.
+Random Data:: This data can change any time and it does not make sense
+  to cache it.
+
+For every dataset defined, the lifetime category is annotated, too. This
+comes in handy later to do any performance optimations from the client
+side, because it's easy to see when the caches are invalidated.
+
+[[datatypes]]
+=== Datatypes
+This protocol describes a binary data format. This has the drawback of
+not beeing easily readable by humans footnote:[Although it is possible
+to write software that automatically converts it into something human
+readable]. On the other hand this makes it much more efficient and fast.
+
+The following datatypes are used:
+
+u8 - u32:: Unsigned integer Types with 1 to 4 bytes length
+f32:: floating point data
+timestamp:: A timestamp in UNIX-Format (4 Bytes, see
+  https://en.wikipedia.org/wiki/Unix_time)
+string:: character sequence of dynamic length
+hash:: 4 byte data-sequence. It is used to compare if two datasets are
+  equal. The difference of this type to the `u32` type is purely
+  semantic. It's only possible to compare if two hashes are equal, but
+  there is no concept of bigger or smaller when comparing hashes.
+schema:: Description of data in a machine readable format. You can find
+  the description of this format under <<schema>>.
+
+The `u8`-`u32` and `f32` data is formatted as
+https://en.wikipedia.org/wiki/Endianness[little endian].
+
+For every dataset defined, the data type is annotated, too.
+
+=== Extendability
+This protocol defines fields which MUST be implemented if you want your
+device to be compatible. It is POSSIBLE, however, to define additional
+commands and enumerations, as long as those definitions don't conflict
+with the ones in this document.
+
+This enables to use this protocol as a base for more specific protocols
+tailored to diffent kinds of devices. This is especialy useful, once
+a device describes the inherited protocol completly in terms of a
+<<schema, schema>>. In consequence this enables for very flexible and
+both forward- and backwardcompatible protocol definitions.
+
+Structure
+---------
+All messages are put in the same frame sceleton.
+
+[ditaa]
+.Frame for request and response
+....
+
+    B0    B1       B2     B3      B4     B5-X   4 Bytes
+  +-----+-------+-------+-----+--------+======+--------+
+  | Frame Deli  | Flags | Cmd | Length | Data | Chksum |
+  +-----+-------+-------+-----+--------+======+--------+
+
+....
+
+=== Frame Delimiter (2 bytes)
+Every Frame starts with the same two bytes:
+
+Frame Delimiter::	0x0D 0x0A
+
+If for any reason, the connection gets out of sync. A client can recover
+by searching for the next frame delimiter. Than it can parse and see
+if the frame is correct footnote:[The bytes selected are the ASCII
+signs for CR-LN. This isn't neccessary because the protocol has binary
+data, but still when it's read as ASCII the messages would appear to be
+lines].
+
+=== Flags (1 byte)
+The first bit of the flags byte can be used by the responder to indicate
+that a command is deprecated.
+
+This allows clients to be written in a forward compatible way. They
+can communicate with a newer server but still be informed about the
+deprecation of messages. They could use this to search for updates or to
+inform the client/user that soon an update is due, without breaking the
+current workflow.
+
+The other bits a reserverd. Device implementers SHOULD always set them
+to zero.
+
+=== CMD (1 byte)
+The CMD byte is used to indicate the category of a command. In the
+response the CMD will not be responded as is, but as the difference
+between 255 (0xFF) and the CMD.
+
+This makes it possible to indicate from the CMD byte if a frame is a
+request or a response.
+
+See <<cmd-ids>> for predefined commands.
+
+=== Payload Size (1 byte)
+Indicates the length of the payload in bytes.
+
+Payload sizes allow for more efficient data parsing than, delimiter
+based protocols. An implementation does not have to scan every single
+byte for beeing a delimiter (plus space overhead for escaping), but can
+only read in the header as a whole and than the payload as a whole.
+
+////
+TODO Maybe payload size 255 should be reserved. It could e.g. indicate
+that the next byte schould be taken into the payload. This would allow
+for small frame headers for most messages (which tend to be small)
+but still give the flexibility to have arbitrary large frames if
+neccesarray.
+////
+
+=== Payload (Data)
+After the payload size follows the payload itself. The interpreation of
+this data depends on the given <<cmd-ids, CMD>>.
+
+=== CRC 32 (Checksum)
+At the end of each frame there is a 4 byte checksum. It's used to
+validate that the data transmission is correct. Sender and receiver
+check if the data is correct. In case something went wrong the frame is
+requested again.
+
+The checksum is calculated over *Frame Delimiter, Flags, Payload Size
+and Payload*.
+
+[source, c]
+.Code to calculate the checksum
+----
+uint32_t checksum_crc32(char *buffer, size_t length)
+{
+  size_t i,j;
+  uint32_t crc = 0;
+  for (i=0; i<length; i++)
+  {
+    crc = crc ^ *buffer++;
+    for (j=0; j<8; j++)
+    {
+      if (crc & 1)
+        crc = (crc>>1) ^ 0xEDB88320;
+      else
+        crc = crc >>1;
+    }
+  }
+  return crc;
+}
+----
+
+=== Enumeration
+In most cases the first byte of the payload is a sub-command
+(enumeration). Its meaning is depending on the CMD.
+
+[[cmd-ids]]
+Index CMDs
+----------
+
+[cols="3", options="header"]
+|====
+| CMD  | Name                      | Description
+| 0x00 | Special response pakets   | Pakets used for errors etc.
+| 0x01 | Read device information   | General information about the device
+|====
+
+[[special-response-packets]]
+=== Special response packets (0x00)
+Some Responses are very common (Especially in case of errors). These can
+be shared between different responses. Therefore the `0x00` command id
+is reserved for those responses.
+
+[ditaa]
+.Response
+....
+
+    B0     B1      B2      B3      B4      B5      B6      B7   B8  B9  B10
+  +------+------+-------+-------+--------+-------+-------+----+---+----+----+
+  | Frame Deli  | CMD   | Flags | Length | Err 1 | Err 2 |      Chksum      |
+  +------+------+-------+-------+--------+-------+-------+----+---+----+----+
+  | 0x53 | 0x54 | 0x00  | 0x00  | 2      |  XX   |  XX   |    |   |    |    |
+  +------+------+-------+-------+--------+-------+-------+----+---+----+----+
+
+....
+
+[cols="3", options="header"]
+|====
+| Error Code1 (UINT16) | Description                 | Error Code2 (UINT16)
+| 0                    | OK                          | -
+| 1                    | Unknown Error               | -
+| 2                    | Packet Error (CRC Error)    | -
+| 3                    | Packet formatting wrong     | -
+| 5                    | Device busy                 | -
+| 6                    | Unknown CmdID               | Cmd code
+| 7                    | Unknown Enum.ID             | Cmd Enumeration
+| 8                    | Data out of range           | Data level (e.g 0=row, 1=column)
+|====
+
+=== Read Device Information (0x01)
+Requests for all dievice specific informations like serial number,
+hardware version, name etc.
+
+The datasets listed in this category have in common, that they all refer
+to attributes of the device as a whole. But they can differ in the
+assigned <<lifetime, lifetime categories>>.
+
+[ditaa]
+.Request
+....
+
+    B0     B1      B2      B3      B4     B5      B6    0-X B       4 Bytes
+  +------+------+-------+-------+--------+-------+-----+======+----+---+----+----+
+  | Frame Deli  | Flags | CMD   | Length | Enumeration | Data |      Chksum      |
+  +------+------+-------+-------+--------+-------+-----+======+----+---+----+----+
+  | 0x53 | 0x54 | 0x00  | 0x01  | 2      |      u16    |  XX  |    |   |    |    |
+  +------+------+-------+-------+--------+-------+-----+======+----+---+----+----+
+
+....
+
+[ditaa]
+.Response
+....
+
+    B0     B1      B2      B3      B4     B5-BX      4 Bytes
+  +------+------+-------+-------+--------+======+----+---+----+----+
+  | Frame Deli  | Flags | CMD   | Length | Data |      Chksum      |
+  +------+------+-------+-------+--------+======+----+---+----+----+
+  | 0x53 | 0x54 | XX    | 0xFE  | XX     |  XX  |    |   |    |    |
+  +------+------+-------+-------+--------+======+----+---+----+----+
+
+....
+
+[cols="d,2d,2*d,1*2a", options="header"]
+|====
+| Enumeration | Name | Payload | Lifetime | Description
+
+| 0
+| Device Serial Number
+| u32
+| Identity Data
+|
+
+| 3
+| Device Name
+| string
+| Identity Data
+| Name of Device
+
+| 4
+| Manufacturer Name
+| string
+| Identity Data
+|
+
+| 100
+| Communication Protocol Version
+| u16
+| Identity Data
+| Protocol Version: Here Version {version}.
+
+| 101
+| Number of subprotocols defined
+| u16
+| Identity Data
+| Get the number of defined subprotocols.
+
+Use Case:
+If a vendor decides to add his own capabilities, this command makes it
+easy to find which capabilities are available. The possibility to define
+multiple allows for modularizing certain functionalities.
+
+| 102,<protocol number>,<chunc number>
+| read subprotocol
+| schema
+| Identity Data
+| Read out a subprotocol
+
+The `protocol number` is used to select the protocol to read. As
+protocol may be to big to fit in one frame they can be retreived as
+chunks. The `chunk number` indicates what chunk to read. When `chunk
+number` 0 is requested, instead of returning a `schema` the number of
+chunks is returned.
+
+| 103,<protocol number>
+| get subprotocol hash
+| hash
+| Identity Data
+| Read out the hash subprotocol
+
+The `protocol number` is used to select the protocol to read. With this
+field the client can find out if a protocol has changed.
+
+Use Case:
+When hotplugging devices, a client may know that the new device, while
+different from the one before has some capabilities unchanged. This
+makes hotplugging faster.
+
+| 250
+| Get current time
+| timestamp
+| Random Data
+|
+
+| 254
+| Number of livetime categories
+| u8
+| Identity Data
+|
+One can define their own liftime categories. The number here should be
+at least 3 to define the (cached) default categories.
+
+| 255
+| Current State
+| hash[n]
+| Random Data
+|
+[horizontal]
+hash[0]=:: Hash over all following hashes in this dataset
+hash[1]=:: Hash over all Identy Data datsets
+hash[2]=:: Hash over all Configuration Data datasets
+hash[3]=:: Hash over all Session Data datasets
+...::
+hash[n]=:: Hash over all Data from a user defined lifetime
+
+See enum id `254` for more information on user defined lifetimes.
+
+|====
+
+[[schema]]
+== Schemas
+One of the possible data types is `schema`. This type makes it possible
+to interpret the syntactical requirements of a derived protocol
+(including this protocol) in a machine readable form.
+
+The base format for the definition of a schema is
+msgpack. The schema as a whole is represented as a
+https://github.com/msgpack/msgpack/blob/master/spec.md#map-format-family[map].
+
+The keys in a map are CMD bytes or enumerations (depending on
+what level of nesting a schema starts). They are represented as
+https://github.com/msgpack/msgpack/blob/master/spec.md#int-format-family[int].
+
+At the level of CMD bytes the values are another schema representing the
+level of enumerations. At the level of enumerations the values are a map
+(of course schemas can be nested arbitraily). The values of this map are
+https://github.com/msgpack/msgpack/blob/master/spec.md#array-format-family[arrays]
+with the following fields:
+
+. Data Type: This is one of the in <<datatypes>> descibed types. The
+  mapping is `1=u8`, `2=u16`, `3=u32`, `4=f32`, `5=timestamp`,
+  `6=string`, `7=hash`, `8=msgpack`, `9=schema`. +
+  In addition to this it could be an array of arrays in the format of
+  this type description. This allows to define multiple fields which are
+  packed as a compound datatype.
+. Name: The name of the field as
+  https://github.com/msgpack/msgpack/blob/master/spec.md#str-format-family[string]
+. Lifetime: Here is one of the categories described in <<lifetime>>
+  annotated. As every implementation can define its own lifetime
+  the mapping is the same as the ordering of hashes in `Read Device
+  Information` `Current State` starting at 1. 0 is used to indicate that
+  the lifetime is `Random Data`. +
+  However the suggested starting point for the mapping of lifetimes is
+  `4=Random Data`, `1=Identity Data`, `2=Configuration Data`, `3=Session
+  Data`.
+. (optional) Metadata: This is a
+  https://github.com/msgpack/msgpack/blob/master/spec.md#map-format-family[map]
+  with strings as keys. Here every additional information can be added.
+  Typical entries are e.g:
+** `description`: A longer description
+** `deprecation_date`: Date when the field was deprecated
+** `migrate`: Information what to do to migrate from a deprecated field
+** `constant`: If the field is fixed here it can be added what the data
+   will be. This can be interesting for validation if two schemas are
+   compatible.
+
