@@ -1,0 +1,5 @@
+= Chaching device protocol family
+
+Definition of multiple connected communiction protocols, aimed to make
+m2m device communiction simpler and faster.
+
